@@ -41,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
         result = run_analyzer(payload)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValidationError) as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 0
+        return 2
 
     json.dump(result, sys.stdout, ensure_ascii=False, indent=args.indent)
     sys.stdout.write("\n")

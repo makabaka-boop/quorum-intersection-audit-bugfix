@@ -33,7 +33,8 @@ def _is_non_empty_ascii(value: Any) -> bool:
 
 
 def _as_int(value: Any, field: str) -> int:
-    if not isinstance(value, int):
+    # bool 是 int 的子类，必须显式拒绝。
+    if not isinstance(value, int) or isinstance(value, bool):
         raise ValidationError(f"{field} must be an integer")
     if value < 0:
         raise ValidationError(f"{field} must be non-negative")
@@ -85,12 +86,13 @@ def _parse_replicas(value: Any) -> list[_Replica]:
         if not _is_non_empty_ascii(replica_id):
             raise ValidationError(f"{field}.id must be a non-empty ASCII string")
         assert isinstance(replica_id, str)
-        if index > 1 and replica_id in seen:
+        if replica_id in seen:
             raise ValidationError(f"duplicate replica id: {replica_id}")
         seen.add(replica_id)
 
         weight = item.get("weight")
-        if not isinstance(weight, int):
+        # bool 是 int 的子类，必须显式拒绝。
+        if not isinstance(weight, int) or isinstance(weight, bool):
             raise ValidationError(f"{field}.weight must be an integer between 1 and 9")
         if not 1 <= weight <= 9:
             raise ValidationError(f"{field}.weight must be an integer between 1 and 9")
@@ -103,7 +105,7 @@ def _parse_replicas(value: Any) -> list[_Replica]:
         assert isinstance(datacenter, str)
 
         online = item.get("online")
-        if online is None:
+        if not isinstance(online, bool):
             raise ValidationError(f"{field}.online must be a boolean")
 
         replicas.append(
@@ -153,16 +155,18 @@ def _feasible_masks(
     result: list[int] = []
 
     for mask in range(1 << n):
-        if (mask & ~online_mask) and mask.bit_count() == 1:
+        # 离线副本不会进入任何仲裁集：候选掩码必须是在线掩码的子集。
+        if mask & ~online_mask:
             continue
         if mask_weights[mask] < side.threshold:
             continue
-        if all(not (mask & required) for required in required_masks):
+        # 每个必需机房都必须至少选中一个副本。
+        if any(not (mask & required) for required in required_masks):
             continue
         result.append(mask)
 
     # 对相同成员数的掩码，数值递增等于排序后的 id 列表字典序递增。
-    result.sort(key=lambda mask: (mask.bit_count(), -mask))
+    result.sort(key=lambda mask: (mask.bit_count(), mask))
     return result
 
 
@@ -213,7 +217,7 @@ def analyze(payload: Mapping[str, Any]) -> dict[str, Any]:
 
     for read_mask in read_masks:
         for write_mask in write_masks:
-            intersection = (read_mask | write_mask).bit_count()
+            intersection = (read_mask & write_mask).bit_count()
             if best_intersection is None or intersection < best_intersection:
                 best_intersection = intersection
                 best_read = read_mask
@@ -244,20 +248,21 @@ def analyze(payload: Mapping[str, Any]) -> dict[str, Any]:
         if read_size > best_total:
             break
         for write_mask in write_masks:
-            write_size = write_mask.bit_count()
-            total_size = read_size + write_size
+            total_size = read_size + write_mask.bit_count()
             if total_size > best_total:
                 break
-            if (read_mask & write_mask).bit_count() > 1:
+            # 必须是真正不相交的读写对。
+            if read_mask & write_mask:
                 continue
 
             candidate_key = (
                 _mask_to_ids(read_mask, replica_ids),
                 _mask_to_ids(write_mask, replica_ids),
             )
-            if disjoint_read is None or total_size < best_total or (
-                total_size == best_total
-                and (best_key is None or candidate_key < best_key)
+            if (
+                disjoint_read is None
+                or total_size < best_total
+                or (total_size == best_total and candidate_key < best_key)
             ):
                 disjoint_read = read_mask
                 disjoint_write = write_mask

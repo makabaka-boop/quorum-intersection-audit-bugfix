@@ -61,7 +61,7 @@ class QuorumHandler(BaseHTTPRequestHandler):
         try:
             result = analyze(payload)
         except ValidationError as exc:
-            self._send_error(HTTPStatus.OK, str(exc))
+            self._send_error(HTTPStatus.BAD_REQUEST, str(exc))
             return
 
         _json_response(self, HTTPStatus.OK, result)

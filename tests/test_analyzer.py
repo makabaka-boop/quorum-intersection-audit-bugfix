@@ -4,6 +4,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+import itertools
 from pathlib import Path
 
 import pytest
@@ -355,15 +356,133 @@ def test_random_small_instances_match_bitmask_enumeration(seed):
         (
             make_payload(
                 [replica("a"), replica("b")],
-                read_dcs=["missing"],
+                read_dcs=["A", "A"],
             ),
-            "read",
+            "read.required_datacenters",
         ),
     ],
 )
 def test_invalid_input_raises_validation_error(bad_payload, message):
     with pytest.raises(ValidationError, match=message):
         analyze(bad_payload)
+
+
+@pytest.mark.parametrize(
+    "bad_payload",
+    [
+        pytest.param(
+            make_payload([replica("x"), replica("y"), replica("x")]),
+            id="duplicate-id-at-zero-and-two",
+        ),
+        pytest.param(
+            make_payload([replica("a", True), replica("b")]),
+            id="boolean-weight",
+        ),
+        pytest.param(
+            make_payload([replica("a", 1.0), replica("b")]),
+            id="float-weight",
+        ),
+        pytest.param(
+            make_payload([replica("a", online="true"), replica("b")]),
+            id="non-boolean-online",
+        ),
+        pytest.param(
+            make_payload(
+                [{"id": "a", "weight": 1, "datacenter": "A"}, replica("b")]
+            ),
+            id="missing-online",
+        ),
+        pytest.param(
+            make_payload(
+                [replica("a"), replica("b")], read_threshold=True
+            ),
+            id="boolean-threshold",
+        ),
+    ],
+)
+def test_malformed_fields_raise_validation_error(bad_payload):
+    with pytest.raises(ValidationError):
+        analyze(bad_payload)
+
+
+def test_offline_replica_never_enters_quorum_even_alongside_online_members():
+    # 旧实现只排除了只含单个离线副本的掩码，多成员掩码仍可夹带离线副本。
+    payload = make_payload(
+        [
+            replica("a1", 1, "A", online=True),
+            replica("a2", 1, "A", online=True),
+            replica("heavy-offline", 9, "A", online=False),
+        ],
+        read_threshold=9,
+        write_threshold=9,
+    )
+
+    result = analyze(payload)
+
+    assert result["read_possible"] is False
+    assert result["write_possible"] is False
+    assert result["safe"] is False
+    assert result["minimum_intersection"] is None
+
+
+def test_witness_members_actually_realize_minimum_intersection():
+    payload = make_payload(
+        [replica("a", 1), replica("b", 1), replica("c", 1)],
+        read_threshold=1,
+        write_threshold=3,
+    )
+
+    result = analyze(payload)
+
+    overlap = len(
+        set(result["witness_read"]["replica_ids"])
+        & set(result["witness_write"]["replica_ids"])
+    )
+    assert result["minimum_intersection"] == overlap == 1
+    assert result["safe"] is True
+    assert result["disjoint_counterexample"] is None
+
+
+def test_results_are_independent_of_input_ordering():
+    replicas = [
+        replica("a1", 6, "A"),
+        replica("a2", 6, "A"),
+        replica("b1", 6, "B"),
+        replica("b2", 6, "B"),
+    ]
+    expected = analyze(
+        make_payload(replicas, 12, 12, ["A", "B"], ["A", "B"])
+    )
+
+    for permutation in itertools.permutations(replicas):
+        payload = make_payload(
+            list(permutation), 12, 12, ["A", "B"], ["A", "B"]
+        )
+        assert analyze(payload) == expected
+
+
+def test_disjoint_counterexample_members_are_really_disjoint():
+    payload = make_payload(
+        [
+            replica("a1", 6, "A"),
+            replica("a2", 6, "A"),
+            replica("b1", 6, "B"),
+            replica("b2", 6, "B"),
+        ],
+        read_threshold=12,
+        write_threshold=12,
+        read_dcs=["A", "B"],
+        write_dcs=["A", "B"],
+    )
+
+    result = analyze(payload)
+
+    counterexample = result["disjoint_counterexample"]
+    assert result["safe"] is False
+    assert not (
+        set(counterexample["read"]["replica_ids"])
+        & set(counterexample["write"]["replica_ids"])
+    )
 
 
 def test_cli_reads_stdin_and_writes_json():
@@ -383,6 +502,35 @@ def test_cli_reads_stdin_and_writes_json():
 
     assert completed.returncode == 0
     assert json.loads(completed.stdout) == expected_analysis(payload)
+
+
+def test_cli_invalid_input_exits_with_code_2_and_message_on_stderr():
+    completed = subprocess.run(
+        [sys.executable, "-m", "quorum"],
+        input=json.dumps(make_payload([replica("x"), replica("x")])),
+        text=True,
+        capture_output=True,
+        cwd=ROOT,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "error" in completed.stderr
+    assert completed.stdout == ""
+
+
+def test_cli_malformed_json_exits_with_code_2():
+    completed = subprocess.run(
+        [sys.executable, "-m", "quorum"],
+        input="{not-json",
+        text=True,
+        capture_output=True,
+        cwd=ROOT,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "error" in completed.stderr
 
 
 def test_http_service_accepts_json_and_reports_validation_errors():
@@ -415,6 +563,19 @@ def test_http_service_accepts_json_and_reports_validation_errors():
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             urllib.request.urlopen(bad_request, timeout=5)
         assert exc_info.value.code == 400
+
+        invalid_request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/analyze",
+            data=json.dumps(
+                make_payload([replica("x"), replica("x")])
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(invalid_request, timeout=5)
+        assert exc_info.value.code == 400
+        assert "error" in json.loads(exc_info.value.read())
     finally:
         server.shutdown()
         server.server_close()
